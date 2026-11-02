@@ -1,0 +1,53 @@
+name: Build and Release JioRemote APK
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up JDK 17
+      uses: actions/setup-java@v4
+      with:
+        java-version: '17'
+        distribution: 'temurin'
+        cache: gradle
+
+    - name: Grant execute permission for gradlew
+      run: chmod +x gradlew
+
+    - name: Build APK with Gradle
+      run: ./gradlew assembleRelease --stacktrace
+
+    - name: Upload APK Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: JioRemotePlus-Release
+        path: app/build/outputs/apk/release/*.apk
+
+    - name: Create GitHub Release
+      uses: softprops/action-gh-release@v2
+      if: startsWith(github.ref, 'refs/tags/') || github.ref == 'refs/heads/main'
+      with:
+        tag_name: v1.0.0-${{ github.run_number }}
+        name: JioRemote+ v1.0.0 (Build ${{ github.run_number }})
+        body: |
+          🚀 **JioRemote+ APK Release**
+          
+          Standalone remote app for **JioAirFiber STB** with dual modes:
+          - ⚡ **Normal Quick Mode**: Quick 1-tap app launch (YouTube, JioCinema, Hotstar, Netflix), Google Voice search mic, direct STB text typing keyboard, volume controls.
+          - 🎮 **Jio Replica Mode**: Exact photorealistic 1:1 replica of physical Jio remote with metallic blue ring D-pad, tactile haptic feedback, volume/channel rockers, and brand styling.
+          
+          Download the APK below and install directly on your Android phone!
+        files: app/build/outputs/apk/release/*.apk
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
