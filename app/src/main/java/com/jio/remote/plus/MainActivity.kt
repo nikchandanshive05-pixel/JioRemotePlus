@@ -9,9 +9,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Refresh
-import androidx.compose.material.icons.filled.Settings
-import androidx.compose.material.icons.filled.Tv
+import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -19,6 +17,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.lifecycleScope
@@ -37,14 +36,14 @@ enum class RemoteMode {
 class MainActivity : ComponentActivity() {
 
     private lateinit var discovery: JioDeviceDiscovery
-    private lateinit var tvClient: AndroidTvRemoteClient
+    private lateinit var remoteManager: AndroidTvRemoteManager
     private val adbClient = AdbFallbackClient()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
         discovery = JioDeviceDiscovery(applicationContext)
-        tvClient = AndroidTvRemoteClient(applicationContext)
+        remoteManager = AndroidTvRemoteManager(applicationContext)
 
         val prefs = getSharedPreferences("jio_remote_prefs", Context.MODE_PRIVATE)
         val savedIp = prefs.getString("last_stb_ip", "") ?: ""
@@ -64,6 +63,7 @@ class MainActivity : ComponentActivity() {
                     JioRemoteMainScreen(
                         savedIp = savedIp,
                         discovery = discovery,
+                        remoteManager = remoteManager,
                         onSaveIp = { ip ->
                             prefs.edit().putString("last_stb_ip", ip).apply()
                         },
@@ -82,7 +82,7 @@ class MainActivity : ComponentActivity() {
         }
 
         lifecycleScope.launch {
-            tvClient.initializeKeyStore()
+            remoteManager.getOrGenerateCertificates()
             discovery.startDiscovery()
         }
     }
@@ -90,9 +90,9 @@ class MainActivity : ComponentActivity() {
     private fun dispatchKey(host: String, key: RemoteKey) {
         lifecycleScope.launch {
             if (host.isNotBlank()) {
-                val adbSuccess = adbClient.sendKeyEvent(host, key.keyCode)
-                if (!adbSuccess) {
-                    tvClient.sendKeyCode(key.keyCode)
+                val ok = remoteManager.sendKey(host, key.keyCode)
+                if (!ok) {
+                    adbClient.sendKeyEvent(host, key.keyCode)
                 }
             }
         }
@@ -101,11 +101,10 @@ class MainActivity : ComponentActivity() {
     private fun dispatchLaunchApp(host: String, app: RemoteAppShortcut) {
         lifecycleScope.launch {
             if (host.isNotBlank()) {
-                val ok = adbClient.launchApp(host, app.packageName)
+                val appLink = "https://www.youtube.com" // or market/custom intent
+                val ok = remoteManager.launchAppUri(host, appLink)
                 if (!ok) {
-                    withContext(Dispatchers.Main) {
-                        Toast.makeText(this@MainActivity, "Launching ${app.name} on $host", Toast.LENGTH_SHORT).show()
-                    }
+                    adbClient.launchApp(host, app.packageName)
                 }
             }
         }
@@ -122,7 +121,7 @@ class MainActivity : ComponentActivity() {
     override fun onDestroy() {
         super.onDestroy()
         discovery.stopDiscovery()
-        tvClient.disconnect()
+        remoteManager.disconnectCommands()
     }
 }
 
@@ -130,15 +129,24 @@ class MainActivity : ComponentActivity() {
 fun JioRemoteMainScreen(
     savedIp: String,
     discovery: JioDeviceDiscovery,
+    remoteManager: AndroidTvRemoteManager,
     onSaveIp: (String) -> Unit,
     onSendKey: (String, RemoteKey) -> Unit,
     onLaunchApp: (String, RemoteAppShortcut) -> Unit,
     onSendText: (String, String) -> Unit
 ) {
+    val coroutineScope = rememberCoroutineScope()
     var activeMode by remember { mutableStateOf(RemoteMode.QUICK) }
     var currentHost by remember { mutableStateOf(savedIp) }
-    var showIpDialog by remember { mutableStateOf(false) }
+
+    // Dialog States
+    var showConnectDialog by remember { mutableStateOf(false) }
     var ipInput by remember { mutableStateOf(savedIp) }
+    
+    var showPairingDialog by remember { mutableStateOf(false) }
+    var pairCodeInput by remember { mutableStateOf("") }
+    var pairingLoading by remember { mutableStateOf(false) }
+    var pairingStatusMsg by remember { mutableStateOf("") }
 
     val discoveredList by discovery.discoveredDevices.collectAsState()
 
@@ -152,28 +160,32 @@ fun JioRemoteMainScreen(
         }
     }
 
-    if (showIpDialog) {
+    // 1. IP / Discovery Dialog
+    if (showConnectDialog) {
         AlertDialog(
-            onDismissRequest = { showIpDialog = false },
-            title = { Text("JioAirFiber STB Connection") },
+            onDismissRequest = { showConnectDialog = false },
+            title = { Text("JioAirFiber Connection") },
             text = {
                 Column {
-                    Text("Enter STB Wi-Fi IP Address (e.g. 192.168.29.X):", fontSize = 13.sp)
+                    Text("Enter STB Wi-Fi IP address:", fontSize = 13.sp)
                     Spacer(modifier = Modifier.height(8.dp))
                     OutlinedTextField(
                         value = ipInput,
                         onValueChange = { ipInput = it },
-                        placeholder = { Text("192.168.29.100") },
+                        placeholder = { Text("192.168.29.X") },
                         modifier = Modifier.fillMaxWidth()
                     )
-                    Spacer(modifier = Modifier.height(12.dp))
+                    Spacer(modifier = Modifier.height(14.dp))
                     if (discoveredList.isNotEmpty()) {
-                        Text("Discovered Nearby Devices:", fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                        Text("Discovered STB Devices:", fontWeight = FontWeight.Bold, fontSize = 12.sp)
                         discoveredList.forEach { dev ->
-                            TextButton(onClick = {
-                                dev.host?.hostAddress?.let { ipInput = it }
-                            }) {
-                                Text("${dev.name} (${dev.host?.hostAddress})")
+                            TextButton(
+                                onClick = {
+                                    dev.host?.hostAddress?.let { ipInput = it }
+                                },
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Text("${dev.name} (${dev.host?.hostAddress})", textAlign = TextAlign.Start)
                             }
                         }
                     }
@@ -183,14 +195,114 @@ fun JioRemoteMainScreen(
                 Button(onClick = {
                     currentHost = ipInput.trim()
                     onSaveIp(currentHost)
-                    showIpDialog = false
+                    showConnectDialog = false
+                    // Start pairing process automatically
+                    if (currentHost.isNotBlank()) {
+                        pairingStatusMsg = "Connecting to TV to show code..."
+                        showPairingDialog = true
+                        pairingLoading = true
+                        coroutineScope.launch {
+                            val res = remoteManager.startPairing(currentHost)
+                            pairingLoading = false
+                            if (res.isSuccess) {
+                                pairingStatusMsg = "Enter the 6-character code showing on your TV screen:"
+                            } else {
+                                pairingStatusMsg = "Could not reach TV: ${res.exceptionOrNull()?.message ?: "Check IP & Wi-Fi"}"
+                            }
+                        }
+                    }
                 }) {
-                    Text("Save & Connect")
+                    Text("Connect & Pair")
                 }
             },
             dismissButton = {
-                TextButton(onClick = { showIpDialog = false }) {
+                TextButton(onClick = { showConnectDialog = false }) {
                     Text("Cancel")
+                }
+            }
+        )
+    }
+
+    // 2. TV Code Pairing Dialog
+    if (showPairingDialog) {
+        AlertDialog(
+            onDismissRequest = {
+                if (!pairingLoading) showPairingDialog = false
+            },
+            title = {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Default.Pin, contentDescription = null, tint = Color(0xFF0078FF))
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text("Pair with Jio STB")
+                }
+            },
+            text = {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Text(
+                        text = pairingStatusMsg,
+                        fontSize = 14.sp,
+                        color = Color.White.copy(alpha = 0.85f),
+                        textAlign = TextAlign.Center
+                    )
+                    Spacer(modifier = Modifier.height(16.dp))
+
+                    if (pairingLoading) {
+                        CircularProgressIndicator(color = Color(0xFF0078FF))
+                    } else {
+                        OutlinedTextField(
+                            value = pairCodeInput,
+                            onValueChange = {
+                                if (it.length <= 6) pairCodeInput = it.uppercase()
+                            },
+                            placeholder = { Text("e.g. A1B2C3") },
+                            singleLine = true,
+                            textStyle = LocalTextStyle.current.copy(
+                                textAlign = TextAlign.Center,
+                                fontSize = 22.sp,
+                                fontWeight = FontWeight.Bold,
+                                letterSpacing = 4.sp
+                            ),
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                    }
+                }
+            },
+            confirmButton = {
+                if (!pairingLoading) {
+                    Button(
+                        onClick = {
+                            if (pairCodeInput.length == 6) {
+                                pairingLoading = true
+                                pairingStatusMsg = "Pairing with TV..."
+                                coroutineScope.launch {
+                                    val res = remoteManager.finishPairing(pairCodeInput)
+                                    pairingLoading = false
+                                    if (res.isSuccess) {
+                                        showPairingDialog = false
+                                        pairCodeInput = ""
+                                        // Connect commands
+                                        remoteManager.connectCommands(currentHost)
+                                    } else {
+                                        pairingStatusMsg = "Incorrect code or pairing error. Please retry."
+                                    }
+                                }
+                            }
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0078FF)),
+                        enabled = pairCodeInput.length == 6
+                    ) {
+                        Text("Pair Code")
+                    }
+                }
+            },
+            dismissButton = {
+                if (!pairingLoading) {
+                    TextButton(onClick = {
+                        showPairingDialog = false
+                        pairCodeInput = ""
+                    }) {
+                        Text("Cancel")
+                    }
                 }
             }
         )
@@ -242,18 +354,18 @@ fun JioRemoteMainScreen(
             SuggestionChip(
                 onClick = {
                     ipInput = currentHost
-                    showIpDialog = true
+                    showConnectDialog = true
                 },
                 label = {
                     Text(
-                        if (currentHost.isNotBlank()) currentHost else "Find STB",
+                        if (currentHost.isNotBlank()) currentHost else "Pair TV",
                         fontSize = 11.sp,
                         color = if (currentHost.isNotBlank()) Color(0xFF00E676) else Color(0xFFFFB300)
                     )
                 },
                 icon = {
                     Icon(
-                        Icons.Default.Tv,
+                        if (currentHost.isNotBlank()) Icons.Default.Tv else Icons.Default.Add,
                         contentDescription = "STB",
                         tint = if (currentHost.isNotBlank()) Color(0xFF00E676) else Color(0xFFFFB300),
                         modifier = Modifier.size(16.dp)
